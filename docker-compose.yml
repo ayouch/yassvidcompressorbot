@@ -1,0 +1,31 @@
+services:
+  # Self-hosted Telegram Bot API server. Raises the bot file limits from
+  # 20MB download / 50MB upload (public API) up to 2GB.
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+    command: ["--local"]
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    restart: unless-stopped
+
+  bot:
+    build: .
+    depends_on:
+      - telegram-bot-api
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_API_BASE: http://telegram-bot-api:8081
+      LOCAL_MODE: "true"
+      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS:-}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-1}
+    volumes:
+      # Shared with the API server so the bot can read downloaded files
+      # directly from disk in local mode (must be the same mount path).
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    restart: unless-stopped
+
+volumes:
+  telegram-bot-api-data:
