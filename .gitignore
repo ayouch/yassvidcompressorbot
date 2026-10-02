@@ -5,7 +5,13 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
 venv/
+
+# Runtime and host-specific deployment files
+*.log
+/run.sh
+/watchdog.sh
 
 # OS / editor
 .DS_Store

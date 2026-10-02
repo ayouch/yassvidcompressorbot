@@ -1,8 +1,8 @@
 # Video Compressor Telegram Bot
 
-Send a video to the bot; it re-encodes it with FFmpeg and sends the smaller file back.
+Send a video to the bot; it downloads the file, lets you choose the saved default FFmpeg profile or a custom FFmpeg command you paste, then sends the processed file back. Use `/status` or `/queue` to check the current workload, and during compression the bot updates the same message with live progress about every 5 seconds.
 
-**Compression command used:**
+**Default compression command used:**
 
 ```
 ffmpeg -i input -c:v libx264 -crf 23 -preset slow -c:a aac -b:a 128k output.mp4
@@ -37,7 +37,7 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
-Then open Telegram, message your bot, and send it a video.
+Then open Telegram, message your bot, and send it a video. After download, choose the default FFmpeg profile or paste your own custom FFmpeg command.
 
 > **Tip:** For large videos, send them as a **File/Document** (paperclip →
 > File), not as a regular video. Telegram pre-compresses videos sent the normal
@@ -67,6 +67,7 @@ BOT_TOKEN=xxxx LOCAL_MODE=false TELEGRAM_API_BASE=https://api.telegram.org pytho
 ## How it works
 
 1. Bot receives a video/document and downloads it (locally, in local mode).
-2. Runs the FFmpeg command above into a temp dir, one job at a time by default.
-3. Sends the result back as a document (so Telegram doesn't re-process it),
-   with a before/after size summary, then deletes the temp files.
+2. It asks whether to use the saved default FFmpeg command or a custom FFmpeg command.
+3. If you choose custom, paste a full command that starts with `ffmpeg` and includes both `{input}` and `{output}` placeholders.
+4. The bot runs the selected command in a temp dir, one job at a time by default.
+5. It sends the result back as a document (so Telegram doesn't re-process it), with a before/after size summary, then deletes the temp files.
