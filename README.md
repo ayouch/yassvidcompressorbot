@@ -1,6 +1,6 @@
 # Video Compressor Telegram Bot
 
-Send a video to the bot; it downloads the file, lets you choose the saved default FFmpeg profile or a custom FFmpeg command you paste, then sends the processed file back. Use `/status` or `/queue` to check the current workload, and during compression the bot updates the same message with live progress about every 5 seconds.
+Send a video to the bot; it downloads the file, compresses it with the default FFmpeg profile, then sends the processed file back. If a video is already compressing, new videos wait in a queue and start automatically, in the order they were received. Use `/status` or `/queue` to check the current workload, and during compression the bot updates the same message with live progress about every 5 seconds.
 
 **Default compression command used:**
 
@@ -37,7 +37,7 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
-Then open Telegram, message your bot, and send it a video. After download, choose the default FFmpeg profile or paste your own custom FFmpeg command.
+Then open Telegram, message your bot, and send it a video. The bot compresses it with the default FFmpeg profile and sends the result back.
 
 > **Tip:** For large videos, send them as a **File/Document** (paperclip →
 > File), not as a regular video. Telegram pre-compresses videos sent the normal
@@ -50,7 +50,7 @@ Then open Telegram, message your bot, and send it a video. After download, choos
 | `BOT_TOKEN` | Bot token from BotFather (required) |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | Credentials for the local API server (required) |
 | `ALLOWED_USER_IDS` | Comma-separated user ids allowed to use the bot. Empty = everyone |
-| `MAX_CONCURRENT_JOBS` | Simultaneous FFmpeg jobs (default `1`) |
+| `MAX_CONCURRENT_JOBS` | Simultaneous FFmpeg jobs (default `1`). Extra videos wait in a FIFO queue |
 
 To find your numeric user id, message [@userinfobot](https://t.me/userinfobot).
 
@@ -66,8 +66,7 @@ BOT_TOKEN=xxxx LOCAL_MODE=false TELEGRAM_API_BASE=https://api.telegram.org pytho
 
 ## How it works
 
-1. Bot receives a video/document and downloads it (locally, in local mode).
-2. It asks whether to use the saved default FFmpeg command or a custom FFmpeg command.
-3. If you choose custom, paste a full command that starts with `ffmpeg` and includes both `{input}` and `{output}` placeholders.
-4. The bot runs the selected command in a temp dir, one job at a time by default.
-5. It sends the result back as a document (so Telegram doesn't re-process it), with a before/after size summary, then deletes the temp files.
+1. Bot receives a video/document and places it in a FIFO queue immediately, so more videos can be sent while one is already running.
+2. It downloads queued videos in the order they arrived, including while another video is compressing.
+3. It compresses each file with the default FFmpeg profile. With the default settings this is one video at a time, and the next one starts as soon as the current one finishes.
+4. It sends the result back as a document (so Telegram doesn't re-process it), with a before/after size summary, then deletes the temp files.

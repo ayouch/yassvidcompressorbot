@@ -5,19 +5,17 @@ import asyncio
 from dataclasses import dataclass
 import logging
 import os
-import shlex
 import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -42,14 +40,10 @@ ALLOWED_USER_IDS = {
     int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
 }
 
-# Limit simultaneous FFmpeg jobs so the VPS does not get overwhelmed.
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))
-_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+# How many videos may be compressed at the same time. Extra videos wait in a
+# FIFO queue and start in the order they were received.
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MAX_CONCURRENT_JOBS", "1")))
 
-PENDING_JOB_KEY = "pending_video_job"
-AWAITING_CUSTOM_COMMAND_KEY = "awaiting_custom_ffmpeg_command"
-DEFAULT_COMMAND_CALLBACK = "ffmpeg:default"
-CUSTOM_COMMAND_CALLBACK = "ffmpeg:custom"
 PROGRESS_UPDATE_INTERVAL_SECONDS = 5.0
 
 
@@ -109,8 +103,200 @@ class JobTracker:
                 waiting_jobs=waiting_jobs,
             )
 
+    async def jobs_ahead(self, job_id: int) -> int:
+        """How many jobs will be compressed before this one, including the active job."""
+        async with self._lock:
+            if job_id in self._active:
+                return 0
+            try:
+                waiting_index = list(self._waiting).index(job_id)
+            except ValueError:
+                return 0
+            return len(self._active) + waiting_index
 
-JOB_TRACKER = JobTracker(MAX_CONCURRENT_JOBS)
+
+@dataclass
+class QueuedVideo:
+    bot: Bot
+    chat_id: int
+    original_message_id: int
+    status_message_id: int
+    file_id: str
+    file_name: str
+    media_duration: float | None
+    job_id: int = 0
+    workdir: str = ""
+    input_path: str = ""
+    output_path: str = ""
+    original_size: int = 0
+    duration_seconds: float | None = None
+    last_status_text: str = ""
+
+
+class VideoQueue:
+    """Accept videos immediately and compress them in arrival order.
+
+    One download worker saves files in the order they were received, including
+    while a compression is running. Compression workers then pick up the saved
+    files in that same order. With the default of one compression worker, the
+    next video starts as soon as the current one finishes.
+    """
+
+    def __init__(self, max_concurrent_jobs: int) -> None:
+        if max_concurrent_jobs < 1:
+            raise ValueError("max_concurrent_jobs must be at least 1")
+        self.max_concurrent_jobs = max_concurrent_jobs
+        self.tracker = JobTracker(max_concurrent_jobs)
+        self._incoming: asyncio.Queue[tuple[int, Any]] = asyncio.Queue()
+        self._ready: asyncio.Queue[tuple[int, Any]] = asyncio.Queue()
+        self._state_lock = asyncio.Lock()
+        self._reserved: set[int] = set()
+        self._tasks: list[asyncio.Task[None]] = []
+        self._download: Callable[[Any], Awaitable[None]] | None = None
+        self._compress: Callable[[Any], Awaitable[None]] | None = None
+        self._on_downloaded: Callable[[int, Any], Awaitable[None]] | None = None
+        self._on_download_error: Callable[[Any, BaseException], Awaitable[None]] | None = None
+        self._cleanup: Callable[[Any], Awaitable[None]] | None = None
+
+    def start(
+        self,
+        download: Callable[[Any], Awaitable[None]],
+        compress: Callable[[Any], Awaitable[None]],
+        *,
+        on_downloaded: Callable[[int, Any], Awaitable[None]] | None = None,
+        on_download_error: Callable[[Any, BaseException], Awaitable[None]] | None = None,
+        cleanup: Callable[[Any], Awaitable[None]] | None = None,
+    ) -> None:
+        if self._tasks:
+            raise RuntimeError("Video queue is already running")
+        self._download = download
+        self._compress = compress
+        self._on_downloaded = on_downloaded
+        self._on_download_error = on_download_error
+        self._cleanup = cleanup
+        self._tasks = [
+            asyncio.create_task(self._download_loop(), name="video-download-queue"),
+            *[
+                asyncio.create_task(self._compress_loop(), name=f"video-compress-queue-{index}")
+                for index in range(self.max_concurrent_jobs)
+            ],
+        ]
+        logger.info("Video queue started with %s compression worker(s)", self.max_concurrent_jobs)
+
+    async def reserve(self, name: str) -> tuple[int, int]:
+        """Remember a video and return its id plus how many jobs are ahead of it.
+
+        The job is not given to a worker until `activate`, so the caller can
+        tell the user their place in line first.
+        """
+        async with self._state_lock:
+            job_id = await self.tracker.enqueue(name)
+            self._reserved.add(job_id)
+            jobs_ahead = await self.tracker.jobs_ahead(job_id)
+            return job_id, jobs_ahead
+
+    async def activate(self, job_id: int, payload: Any) -> None:
+        async with self._state_lock:
+            if job_id not in self._reserved:
+                raise RuntimeError(f"Job {job_id} is not reserved")
+            self._reserved.remove(job_id)
+            # Unbounded queue, so this does not wait. Keeping it inside the lock
+            # preserves arrival order when two videos are accepted close together.
+            self._incoming.put_nowait((job_id, payload))
+
+    async def discard(self, job_id: int) -> None:
+        """Drop a reservation that never became a queued job."""
+        async with self._state_lock:
+            if job_id not in self._reserved:
+                return
+            self._reserved.remove(job_id)
+        await self.tracker.finish(job_id)
+
+    async def submit(self, name: str, payload: Any) -> int:
+        """Reserve and activate a job. Returns how many jobs are ahead of it."""
+        job_id, jobs_ahead = await self.reserve(name)
+        await self.activate(job_id, payload)
+        return jobs_ahead
+
+    async def wait_for_downloads(self) -> None:
+        await self._incoming.join()
+
+    async def wait_for_compression(self) -> None:
+        await self._ready.join()
+
+    async def stop(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        await self._drain_unfinished(self._ready)
+        await self._drain_unfinished(self._incoming)
+
+    async def _drain_unfinished(self, queue: asyncio.Queue[tuple[int, Any]]) -> None:
+        while not queue.empty():
+            job_id, payload = queue.get_nowait()
+            try:
+                await self.tracker.finish(job_id)
+                await self._run_cleanup(payload)
+            finally:
+                queue.task_done()
+
+    async def _run_cleanup(self, payload: Any) -> None:
+        if self._cleanup is None:
+            return
+        try:
+            await self._cleanup(payload)
+        except Exception:
+            logger.exception("Failed to clean up a queued video")
+
+    async def _download_loop(self) -> None:
+        assert self._download is not None
+        while True:
+            job_id, payload = await self._incoming.get()
+            handed_off = False
+            try:
+                try:
+                    await self._download(payload)
+                except Exception as exc:
+                    try:
+                        if self._on_download_error is not None:
+                            await self._on_download_error(payload, exc)
+                    except Exception:
+                        logger.exception("Failed to report a download error")
+                else:
+                    if self._on_downloaded is not None:
+                        try:
+                            await self._on_downloaded(job_id, payload)
+                        except Exception:
+                            logger.exception("Failed to update queue status for job %s", job_id)
+                    await self._ready.put((job_id, payload))
+                    handed_off = True
+            finally:
+                if not handed_off:
+                    await self.tracker.finish(job_id)
+                    await self._run_cleanup(payload)
+                self._incoming.task_done()
+
+    async def _compress_loop(self) -> None:
+        assert self._compress is not None
+        while True:
+            job_id, payload = await self._ready.get()
+            try:
+                await self.tracker.start(job_id)
+                try:
+                    await self._compress(payload)
+                except Exception:
+                    logger.exception("Compression job failed")
+                finally:
+                    await self.tracker.finish(job_id)
+                    await self._run_cleanup(payload)
+            finally:
+                self._ready.task_done()
+
+
+VIDEO_QUEUE = VideoQueue(MAX_CONCURRENT_JOBS)
 
 
 def parse_ffmpeg_speed(speed_text: str | None) -> float | None:
@@ -259,41 +445,6 @@ def build_default_ffmpeg_command(input_path: Path, output_path: Path) -> list[st
     ]
 
 
-def build_custom_ffmpeg_command(command_text: str, input_path: Path, output_path: Path) -> list[str]:
-    command_text = command_text.strip()
-    if not command_text:
-        raise ValueError("Custom command cannot be empty.")
-    if "{input}" not in command_text or "{output}" not in command_text:
-        raise ValueError(
-            "Custom command must include both {input} and {output} placeholders."
-        )
-
-    raw_tokens = shlex.split(command_text)
-    if not raw_tokens:
-        raise ValueError("Custom command cannot be empty.")
-    if raw_tokens[0] != "ffmpeg":
-        raise ValueError("Custom command must start with ffmpeg.")
-
-    cmd: list[str] = []
-    for token in raw_tokens:
-        if token == "{input}":
-            cmd.append(str(input_path))
-        elif token == "{output}":
-            cmd.append(str(output_path))
-        else:
-            cmd.append(token)
-    return cmd
-
-
-def command_choice_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Use default compression", callback_data=DEFAULT_COMMAND_CALLBACK)],
-            [InlineKeyboardButton("Paste custom FFmpeg command", callback_data=CUSTOM_COMMAND_CALLBACK)],
-        ]
-    )
-
-
 def format_status_text(snapshot: QueueSnapshot) -> str:
     lines = [
         f"Status: {'busy' if snapshot.active_count or snapshot.waiting_count else 'idle'}",
@@ -306,6 +457,27 @@ def format_status_text(snapshot: QueueSnapshot) -> str:
         lines.append("Current jobs:")
         lines.extend(f"- {job}" for job in snapshot.active_jobs)
     return "\n".join(lines)
+
+
+def videos_ahead_text(count: int) -> str:
+    noun = "video" if count == 1 else "videos"
+    return f"{count} {noun} ahead of you"
+
+
+def format_acceptance_text(jobs_ahead: int) -> str:
+    if jobs_ahead <= 0:
+        return "Downloading..."
+    return (
+        f"Queued. {videos_ahead_text(jobs_ahead)}.\n"
+        "Downloading now. Compression starts automatically when the earlier videos finish."
+    )
+
+
+def format_waiting_text(jobs_ahead: int) -> str:
+    return (
+        f"Downloaded. {videos_ahead_text(jobs_ahead)}.\n"
+        "Compression starts automatically when the earlier videos finish."
+    )
 
 
 def format_queue_text(snapshot: QueueSnapshot) -> str:
@@ -327,19 +499,6 @@ def format_queue_text(snapshot: QueueSnapshot) -> str:
     return "\n".join(lines)
 
 
-def get_pending_job(context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any] | None:
-    pending = context.user_data.get(PENDING_JOB_KEY)
-    return pending if isinstance(pending, dict) else None
-
-
-def clear_pending_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    pending = get_pending_job(context)
-    if pending:
-        shutil.rmtree(pending.get("workdir", ""), ignore_errors=True)
-    context.user_data.pop(PENDING_JOB_KEY, None)
-    context.user_data.pop(AWAITING_CUSTOM_COMMAND_KEY, None)
-
-
 async def run_ffmpeg(
     cmd: list[str],
     *,
@@ -349,52 +508,62 @@ async def run_ffmpeg(
     """Run the compression command. Raises RuntimeError on failure."""
     progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
     logger.info("Running: %s", " ".join(cmd))
-    proc = await asyncio.create_subprocess_exec(
-        *progress_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    start_time = time.monotonic()
-    last_progress_update_at: float | None = None
-    progress_fields: dict[str, str] = {}
-
-    assert proc.stdout is not None
-    async for raw_line in proc.stdout:
-        line = raw_line.decode(errors="replace").strip()
-        if not line or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        progress_fields[key] = value
-        if key != "progress":
-            continue
-
-        snapshot = build_progress_snapshot(
-            progress_fields,
-            duration_seconds=duration_seconds,
-            elapsed_seconds=time.monotonic() - start_time,
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *progress_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if (
-            on_progress
-            and snapshot is not None
-            and value != "end"
-            and should_emit_progress_update(last_progress_update_at, time.monotonic())
-        ):
-            await on_progress(snapshot)
-            last_progress_update_at = time.monotonic()
-        progress_fields = {}
 
-    assert proc.stderr is not None
-    stderr = await proc.stderr.read()
-    return_code = await proc.wait()
-    if return_code != 0:
-        tail = stderr.decode(errors="replace")[-1500:]
-        raise RuntimeError(f"FFmpeg exited with code {return_code}:\n{tail}")
+        start_time = time.monotonic()
+        last_progress_update_at: float | None = None
+        progress_fields: dict[str, str] = {}
+
+        assert proc.stdout is not None
+        async for raw_line in proc.stdout:
+            line = raw_line.decode(errors="replace").strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            progress_fields[key] = value
+            if key != "progress":
+                continue
+
+            snapshot = build_progress_snapshot(
+                progress_fields,
+                duration_seconds=duration_seconds,
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+            if (
+                on_progress
+                and snapshot is not None
+                and value != "end"
+                and should_emit_progress_update(last_progress_update_at, time.monotonic())
+            ):
+                await on_progress(snapshot)
+                last_progress_update_at = time.monotonic()
+            progress_fields = {}
+
+        assert proc.stderr is not None
+        stderr = await proc.stderr.read()
+        return_code = await proc.wait()
+        if return_code != 0:
+            tail = stderr.decode(errors="replace")[-1500:]
+            raise RuntimeError(f"FFmpeg exited with code {return_code}:\n{tail}")
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Send me a video and I'll download it, then let you choose either the saved default FFmpeg command or a custom FFmpeg command that you paste.\n\n"
+        "Send me a video and I'll compress it with the default profile and send it back.\n\n"
+        "If I'm already compressing, new videos wait in line and start automatically, in the order you sent them.\n\n"
         "Default profile: H.264, CRF 23, slow preset.\n"
         "Use /status or /queue to check what is running.\n"
         "Tip: send large videos as a file/document to avoid Telegram shrinking them before I even see them."
@@ -402,12 +571,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    had_pending = bool(get_pending_job(context)) or bool(context.user_data.get(AWAITING_CUSTOM_COMMAND_KEY))
-    clear_pending_job(context)
-    if had_pending:
-        await update.message.reply_text("Cancelled the pending video job.")
-    else:
-        await update.message.reply_text("There is no pending video job to cancel.")
+    await update.message.reply_text(
+        "Videos are compressed automatically in the order they arrive. A job that is already queued can't be cancelled."
+    )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -415,7 +581,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Sorry, you're not authorized to use this bot.")
         return
 
-    snapshot = await JOB_TRACKER.snapshot()
+    snapshot = await VIDEO_QUEUE.tracker.snapshot()
     await update.message.reply_text(format_status_text(snapshot))
 
 
@@ -424,102 +590,116 @@ async def queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Sorry, you're not authorized to use this bot.")
         return
 
-    snapshot = await JOB_TRACKER.snapshot()
+    snapshot = await VIDEO_QUEUE.tracker.snapshot()
     await update.message.reply_text(format_queue_text(snapshot))
 
 
-async def process_pending_job(
-    context: ContextTypes.DEFAULT_TYPE,
-    pending: dict[str, Any],
-    cmd: list[str],
-    mode_label: str,
-) -> None:
-    input_path = Path(pending["input_path"])
-    output_path = Path(pending["output_path"])
-    original_size = pending["original_size"]
-    duration_seconds = pending.get("duration_seconds")
-    chat_id = pending["chat_id"]
-    status_message_id = pending["status_message_id"]
-    original_message_id = pending["original_message_id"]
-    display_name = pending["display_name"]
-    job_id = await JOB_TRACKER.enqueue(display_name)
-    last_status_text: str | None = None
+async def edit_job_status(job: QueuedVideo, text: str) -> None:
+    if text == job.last_status_text:
+        return
+    await job.bot.edit_message_text(
+        chat_id=job.chat_id,
+        message_id=job.status_message_id,
+        text=text,
+    )
+    job.last_status_text = text
 
-    async def update_status_message(text: str) -> None:
-        nonlocal last_status_text
-        if text == last_status_text:
-            return
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_message_id,
-            text=text,
-        )
-        last_status_text = text
+
+async def cleanup_queued_video(job: QueuedVideo) -> None:
+    if not job.workdir:
+        return
+    shutil.rmtree(job.workdir, ignore_errors=True)
+    job.workdir = ""
+
+
+async def download_queued_video(job: QueuedVideo) -> None:
+    workdir = Path(tempfile.mkdtemp(prefix="vidc_"))
+    job.workdir = str(workdir)
+    safe_name = Path(job.file_name).name or "video.mp4"
+    input_path = workdir / safe_name
+    output_path = workdir / f"{Path(safe_name).stem}_compressed.mp4"
+    job.input_path = str(input_path)
+    job.output_path = str(output_path)
+
+    tg_file = await job.bot.get_file(job.file_id)
+    await tg_file.download_to_drive(custom_path=str(input_path))
+    job.original_size = input_path.stat().st_size
+    job.duration_seconds = job.media_duration or await probe_duration_seconds(input_path)
+
+
+async def announce_downloaded_video(job_id: int, job: QueuedVideo) -> None:
+    jobs_ahead = await VIDEO_QUEUE.tracker.jobs_ahead(job_id)
+    if jobs_ahead <= 0:
+        return
+    await edit_job_status(job, format_waiting_text(jobs_ahead))
+
+
+async def report_download_error(job: QueuedVideo, exc: BaseException) -> None:
+    logger.exception("Failed to download video", exc_info=exc)
+    try:
+        await edit_job_status(job, f"Failed to process video.\n{exc}")
+    except Exception:
+        logger.exception("Failed to report a download error")
+
+
+async def compress_queued_video(job: QueuedVideo) -> None:
+    output_path = Path(job.output_path)
+    original_size = job.original_size
+    mode_label = "default"
 
     async def on_progress(progress: CompressionProgress) -> None:
-        await update_status_message(format_progress_text(mode_label, progress))
+        await edit_job_status(job, format_progress_text(mode_label, progress))
 
     try:
-        snapshot = await JOB_TRACKER.snapshot()
-        ahead_of_you = snapshot.active_count + max(0, snapshot.waiting_count - 1)
-        if ahead_of_you:
-            await update_status_message(
-                f"Queued for compression with the {mode_label} FFmpeg command. "
-                f"Jobs ahead of you: {ahead_of_you}."
-            )
-
-        async with _job_semaphore:
-            await JOB_TRACKER.start(job_id)
-            await update_status_message(
-                f"Compressing with the {mode_label} FFmpeg command...\nProgress: starting..."
-            )
-            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
-            await run_ffmpeg(
-                cmd,
-                duration_seconds=duration_seconds,
-                on_progress=on_progress,
-            )
+        await edit_job_status(
+            job,
+            f"Compressing with the {mode_label} FFmpeg command...\nProgress: starting...",
+        )
+        await job.bot.send_chat_action(job.chat_id, ChatAction.UPLOAD_VIDEO)
+        await run_ffmpeg(
+            build_default_ffmpeg_command(Path(job.input_path), output_path),
+            duration_seconds=job.duration_seconds,
+            on_progress=on_progress,
+        )
 
         compressed_size = output_path.stat().st_size
         saved = original_size - compressed_size
         pct = (saved / original_size * 100) if original_size else 0.0
 
-        await update_status_message(
+        await edit_job_status(
+            job,
             f"Done. {human_size(original_size)} -> {human_size(compressed_size)} "
-            f"({pct:+.1f}% size change). Uploading..."
+            f"({pct:+.1f}% size change). Uploading...",
         )
 
         with output_path.open("rb") as fh:
-            await context.bot.send_document(
-                chat_id=chat_id,
+            await job.bot.send_document(
+                chat_id=job.chat_id,
                 document=fh,
                 filename=output_path.name,
-                reply_to_message_id=original_message_id,
+                reply_to_message_id=job.original_message_id,
                 caption=(
                     f"Compressed with {mode_label} command: {human_size(original_size)} -> "
                     f"{human_size(compressed_size)} ({pct:+.1f}%)"
                 ),
             )
 
-        await context.bot.delete_message(chat_id=chat_id, message_id=status_message_id)
-
+        try:
+            await job.bot.delete_message(chat_id=job.chat_id, message_id=job.status_message_id)
+        except Exception:
+            logger.info("Could not delete the status message for %s", job.file_name, exc_info=True)
     except Exception as exc:  # noqa: BLE001 - report any failure back to the user
         logger.exception("Failed to process video")
         try:
-            await update_status_message(f"Failed to process video.\n{exc}")
+            await edit_job_status(job, f"Failed to process video.\n{exc}")
         except Exception:  # noqa: BLE001
-            await context.bot.send_message(chat_id=chat_id, text=f"Failed to process video.\n{exc}")
-    finally:
-        await JOB_TRACKER.finish(job_id)
-        clear_pending_job(context)
+            await job.bot.send_message(chat_id=job.chat_id, text=f"Failed to process video.\n{exc}")
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         await update.message.reply_text("Sorry, you're not authorized to use this bot.")
         return
-
-    clear_pending_job(context)
 
     message = update.message
     # Accept both native videos and documents whose mime type is video/*.
@@ -533,105 +713,48 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     file_name = getattr(media, "file_name", None) or f"video_{media.file_unique_id}.mp4"
-    stem = Path(file_name).stem
+    job = QueuedVideo(
+        bot=context.bot,
+        chat_id=message.chat_id,
+        original_message_id=message.message_id,
+        status_message_id=0,
+        file_id=media.file_id,
+        file_name=file_name,
+        media_duration=getattr(media, "duration", None),
+    )
 
-    status_message = await message.reply_text("Downloading...")
-    workdir = Path(tempfile.mkdtemp(prefix="vidc_"))
-    input_path = workdir / file_name
-    output_path = workdir / f"{stem}_compressed.mp4"
-
+    job_id: int | None = None
+    activated = False
+    status_message = None
     try:
-        tg_file = await context.bot.get_file(media.file_id)
-        await tg_file.download_to_drive(custom_path=str(input_path))
-        original_size = input_path.stat().st_size
-        duration_seconds = getattr(media, "duration", None) or await probe_duration_seconds(input_path)
-
-        context.user_data[PENDING_JOB_KEY] = {
-            "chat_id": message.chat_id,
-            "original_message_id": message.message_id,
-            "status_message_id": status_message.message_id,
-            "workdir": str(workdir),
-            "input_path": str(input_path),
-            "output_path": str(output_path),
-            "original_size": original_size,
-            "display_name": file_name,
-            "duration_seconds": duration_seconds,
-        }
-        context.user_data[AWAITING_CUSTOM_COMMAND_KEY] = False
-
-        await status_message.edit_text(
-            f"Downloaded ({human_size(original_size)}). Choose how to compress it.",
-            reply_markup=command_choice_keyboard(),
-        )
-
+        job_id, jobs_ahead = await VIDEO_QUEUE.reserve(file_name)
+        job.job_id = job_id
+        acceptance_text = format_acceptance_text(jobs_ahead)
+        status_message = await message.reply_text(acceptance_text)
+        job.status_message_id = status_message.message_id
+        job.last_status_text = acceptance_text
+        await VIDEO_QUEUE.activate(job_id, job)
+        activated = True
+        logger.info("Queued %s with %s video(s) ahead", file_name, jobs_ahead)
     except Exception as exc:  # noqa: BLE001 - report any failure back to the user
-        shutil.rmtree(workdir, ignore_errors=True)
-        logger.exception("Failed to prepare video")
-        await status_message.edit_text(f"Failed to process video.\n{exc}")
-
-
-async def handle_command_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    pending = get_pending_job(context)
-    if not pending:
-        await query.edit_message_text("That video is no longer pending. Please send it again.")
-        context.user_data.pop(AWAITING_CUSTOM_COMMAND_KEY, None)
-        return
-
-    input_path = Path(pending["input_path"])
-    output_path = Path(pending["output_path"])
-
-    if query.data == DEFAULT_COMMAND_CALLBACK:
-        context.user_data[AWAITING_CUSTOM_COMMAND_KEY] = False
-        cmd = build_default_ffmpeg_command(input_path, output_path)
-        await process_pending_job(context, pending, cmd, "default")
-        return
-
-    if query.data == CUSTOM_COMMAND_CALLBACK:
-        context.user_data[AWAITING_CUSTOM_COMMAND_KEY] = True
-        await query.edit_message_text(
-            "Paste your custom FFmpeg command now.\n\n"
-            "Rules:\n"
-            "- It must start with ffmpeg\n"
-            "- It must include both {input} and {output}\n"
-            "- You may quote the placeholders, but you don't have to\n\n"
-            "Example:\n"
-            "ffmpeg -y -i \"{input}\" -vf scale=1280:-2 -c:v libx264 -crf 28 -preset medium -c:a aac -b:a 96k \"{output}\""
-        )
-
-
-async def handle_custom_command_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.user_data.get(AWAITING_CUSTOM_COMMAND_KEY):
-        return
-
-    pending = get_pending_job(context)
-    if not pending:
-        context.user_data.pop(AWAITING_CUSTOM_COMMAND_KEY, None)
-        await update.message.reply_text("That video is no longer pending. Please send it again.")
-        return
-
-    try:
-        cmd = build_custom_ffmpeg_command(
-            update.message.text,
-            Path(pending["input_path"]),
-            Path(pending["output_path"]),
-        )
-    except ValueError as exc:
-        await update.message.reply_text(
-            f"{exc}\n\n"
-            "Example:\n"
-            "ffmpeg -y -i \"{input}\" -vf scale=1280:-2 -c:v libx264 -crf 28 -preset medium -c:a aac -b:a 96k \"{output}\""
-        )
-        return
-
-    context.user_data[AWAITING_CUSTOM_COMMAND_KEY] = False
-    await process_pending_job(context, pending, cmd, "custom")
+        logger.exception("Failed to queue video")
+        if status_message is not None:
+            await status_message.edit_text(f"Failed to queue video.\n{exc}")
+        else:
+            await message.reply_text(f"Failed to queue video.\n{exc}")
+    finally:
+        if job_id is not None and not activated:
+            await VIDEO_QUEUE.discard(job_id)
 
 
 def build_application() -> Application:
-    builder = ApplicationBuilder().token(BOT_TOKEN)
+    builder = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(False)
+        .post_init(start_video_queue)
+        .post_shutdown(stop_video_queue)
+    )
     if API_BASE != "https://api.telegram.org":
         builder = builder.base_url(f"{API_BASE}/bot").base_file_url(f"{API_BASE}/file/bot")
         if LOCAL_MODE:
@@ -641,17 +764,31 @@ def build_application() -> Application:
     return builder.build()
 
 
+async def start_video_queue(application: Application) -> None:
+    del application
+    VIDEO_QUEUE.start(
+        download_queued_video,
+        compress_queued_video,
+        on_downloaded=announce_downloaded_video,
+        on_download_error=report_download_error,
+        cleanup=cleanup_queued_video,
+    )
+
+
+async def stop_video_queue(application: Application) -> None:
+    del application
+    await VIDEO_QUEUE.stop()
+
+
 def main() -> None:
     app = build_application()
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("queue", queue))
-    app.add_handler(CallbackQueryHandler(handle_command_choice, pattern=r"^ffmpeg:"))
     app.add_handler(
         MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video)
     )
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_command_text))
     logger.info("Bot starting (api_base=%s, local_mode=%s)...", API_BASE, LOCAL_MODE)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
